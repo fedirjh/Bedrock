@@ -242,7 +242,8 @@ void _SSignal_StackTrace(int signum, siginfo_t *info, void *ucontext) {
                 SWARN(fullLogLine);
                 if (fd != -1) {
                     fullLogLine = format("{}{}", fullLogLine, "\n");
-                    write(fd, fullLogLine.c_str(), strlen(fullLogLine.c_str()));
+                    ssize_t written = write(fd, fullLogLine.c_str(), strlen(fullLogLine.c_str()));
+                    (void)written; // Suppress unused variable warning
                 }
                 free(frame);
             }
@@ -261,7 +262,8 @@ void _SSignal_StackTrace(int signum, siginfo_t *info, void *ucontext) {
             // Finish writing the crash file with the request details if it exists
             if (fd != -1 && !logMessage.empty()) {
                 logMessage += "\n";
-                write(fd, logMessage.c_str(), strlen(logMessage.c_str()));
+                ssize_t written = write(fd, logMessage.c_str(), strlen(logMessage.c_str()));
+                (void)written; // Suppress unused variable warning
             }
             close(fd);
 

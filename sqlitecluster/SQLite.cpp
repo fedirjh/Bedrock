@@ -112,7 +112,8 @@ bool SQLite::validateDBFormat(const string& filename, bool hctree) {
         FILE* fp = fopen(filename.c_str(), "rb");
         if (fp) {
             char readBuffer[32];
-            fread(readBuffer, 1, sizeof(readBuffer), fp);
+            size_t bytesRead = fread(readBuffer, 1, sizeof(readBuffer), fp);
+            (void)bytesRead; // Suppress unused variable warning
             readBuffer[31] = 0;
             string headerString(readBuffer);
             SINFO("Existing database format: " << headerString);
