@@ -146,7 +146,7 @@ void SStandaloneHTTPSManager::postPoll(fd_map& fdm, SStandaloneHTTPSManager::Tra
     }
 }
 
-SStandaloneHTTPSManager::Transaction::Transaction(SStandaloneHTTPSManager& manager_, const string& requestID) :
+SStandaloneHTTPSManager::Transaction::Transaction(SStandaloneHTTPSManager& manager_, const string& requestID, const string& label_) :
     s(nullptr),
     created(STimeNow()),
     finished(0),
@@ -154,7 +154,8 @@ SStandaloneHTTPSManager::Transaction::Transaction(SStandaloneHTTPSManager& manag
     response(0),
     manager(manager_),
     sentTime(0),
-    requestID(requestID.empty() ? SThreadLogPrefix : requestID)
+    requestID(requestID.empty() ? SThreadLogPrefix : requestID),
+    label(label_)
 {
 }
 

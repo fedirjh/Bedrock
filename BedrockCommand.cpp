@@ -434,6 +434,7 @@ void BedrockCommand::deserializeHTTPSRequests(const string& serializedHTTPSReque
         httpsRequest->timeoutAt = SToUInt64(requestMap["timeoutAt"]);
         httpsRequest->sentTime = SToUInt64(requestMap["sentTime"]);
         httpsRequest->response = SToInt(requestMap["response"]);
+        httpsRequest->label = requestMap["label"];
         httpsRequest->fullRequest.deserialize(SDecodeBase64(requestMap["fullRequest"]));
         httpsRequest->fullResponse.deserialize(SDecodeBase64(requestMap["fullResponse"]));
 
@@ -459,6 +460,7 @@ string BedrockCommand::serializeHTTPSRequests() {
         data["timeoutAt"] = to_string(httpsRequest->timeoutAt);
         data["sentTime"] = to_string(httpsRequest->sentTime);
         data["response"] = to_string(httpsRequest->response);
+        data["label"] = httpsRequest->label;
         data["fullRequest"] = SEncodeBase64(httpsRequest->fullRequest.serialize());
         data["fullResponse"] = SEncodeBase64(httpsRequest->fullResponse.serialize());
         requests.push_back(SComposeJSONObject(data));

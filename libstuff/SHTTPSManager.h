@@ -9,7 +9,7 @@ class SStandaloneHTTPSManager : public STCPManager {
   public:
     struct Transaction {
         // Constructor/Destructor
-        Transaction(SStandaloneHTTPSManager& manager_, const string& requestID = "");
+        Transaction(SStandaloneHTTPSManager& manager_, const string& requestID = "", const string& label_ = "");
         ~Transaction();
 
         // Attributes
@@ -23,6 +23,7 @@ class SStandaloneHTTPSManager : public STCPManager {
         SStandaloneHTTPSManager& manager;
         uint64_t sentTime;
         const string requestID;
+        string label;
     };
 
     static const string proxyAddressHTTPS;
