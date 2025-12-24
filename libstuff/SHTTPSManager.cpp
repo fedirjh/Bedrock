@@ -135,8 +135,26 @@ void SStandaloneHTTPSManager::postPoll(fd_map& fdm, SStandaloneHTTPSManager::Tra
         if ((transaction.s->state.load() > Socket::CONNECTED) ||
             (now > transaction.s->lastSendTime + timeoutMS * 1000) ||
             (now > transaction.timeoutAt)) {
-            SWARN("Connection " << ((transaction.s->state.load() > Socket::CONNECTED) ? "died prematurely" : "timed out"));
-            transaction.response = transaction.s->sendBufferEmpty() ? 501 : 500;
+            // Connection died or timed out. Check if we have any partial response data.
+            bool hasPartialResponse = !transaction.fullResponse.methodLine.empty() || size > 0;
+            if (hasPartialResponse) {
+                // We received some response data before connection closed. This is expected when
+                // server sends error response and closes (especially through proxies). Use the
+                // partial response we got.
+                SINFO("Connection closed after receiving partial response");
+                transaction.finished = now;
+                if (!transaction.fullResponse.methodLine.empty()) {
+                    _onRecv(&transaction);
+                }
+
+                // Clean up the socket
+                delete transaction.s;
+                transaction.s = nullptr;
+            } else {
+                // No response data at all - this is a genuine failure
+                SWARN("Connection " << ((transaction.s->state.load() > Socket::CONNECTED) ? "died prematurely" : "timed out"));
+                transaction.response = transaction.s->sendBufferEmpty() ? 501 : 500;
+            }
         } else {
             // No timeout yet, set nextActivity short enough that it'll catch the next timeout.
             uint64_t remainingUntilTimeoutMS = (timeoutMS * 1000) - (now - transaction.s->lastSendTime);
@@ -189,6 +207,7 @@ SStandaloneHTTPSManager::Transaction* SStandaloneHTTPSManager::_httpsSend(const 
 
     // If this is going to be an https transaction, create a certificate and give it to the socket.
     Socket* s = nullptr;
+    bool usingProxy = false;
     try {
         // If a proxy is set, and it's allowed to use it, go through the proxy.
         bool isHttps = SStartsWith(url, "https://");
@@ -196,7 +215,8 @@ SStandaloneHTTPSManager::Transaction* SStandaloneHTTPSManager::_httpsSend(const 
             string proxyHost, path;
             SParseURI(proxyAddressHTTPS, proxyHost, path);
             SINFO("Proxying " << url << " through " << proxyHost);
-            s = new SHTTPSProxySocket(proxyHost, host);
+            s = new SHTTPSProxySocket(proxyHost, host, transaction->requestID);
+            usingProxy = true;
         } else {
             s = new Socket(host, isHttps);
         }
@@ -205,11 +225,20 @@ SStandaloneHTTPSManager::Transaction* SStandaloneHTTPSManager::_httpsSend(const 
         return _createErrorTransaction();
     }
 
+    // When using a proxy with CONNECT tunnels, remove "Connection: close" header to prevent
+    // premature connection termination during TLS data transfer, which causes SSL EOF errors.
+    // HTTP CONNECT establishes a persistent tunnel that must remain open for the entire TLS session.
+    // HTTP/1.1 uses persistent connections by default, and letting the client/server negotiate
+    // keep-alive naturally is more robust.
+    SData modifiedRequest = request;
+    if (usingProxy) {
+        modifiedRequest.nameValueMap.erase("Connection");
+    }
     transaction->s = s;
-    transaction->fullRequest = request;
+    transaction->fullRequest = modifiedRequest;
 
     // Ship it.
-    transaction->s->send(request.serialize());
+    transaction->s->send(modifiedRequest.serialize());
 
     // Keep track of the transaction.
     return transaction;

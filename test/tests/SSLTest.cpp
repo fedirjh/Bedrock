@@ -63,8 +63,12 @@ struct SSLTest : tpunit::TestFixture {
         const string proxy = "127.0.0.1:3128";
 
         // Create a transaction with a socket, send the above request.
-        SStandaloneHTTPSManager::Transaction* transaction = new SStandaloneHTTPSManager::Transaction(manager);
-        transaction->s = new SHTTPSProxySocket(proxy, host);
+        SStandaloneHTTPSManager::Transaction* transaction = new SStandaloneHTTPSManager::Transaction(manager, "proxyTest");
+        
+        // Verify requestID is set correctly on the transaction
+        EXPECT_EQUAL(transaction->requestID, "proxyTest");
+        
+        transaction->s = new SHTTPSProxySocket(proxy, host, transaction->requestID);
         transaction->timeoutAt = STimeNow() + 5'000'000;
         transaction->s->send(request.serialize());
 
@@ -78,11 +82,11 @@ struct SSLTest : tpunit::TestFixture {
         }
 
         // Validate that the response is reasonable
-        ASSERT_EQUAL(transaction->response, 200);
+        EXPECT_EQUAL(transaction->response, 200);
 
         // Make sure that the response has a body. This differentiates it from the response to a CONNECT message
         // So that we can test we're looking at the actual proxied response and not just the response from the proxy itself.
-        ASSERT_TRUE(transaction->fullResponse.content.size());
+        EXPECT_TRUE(transaction->fullResponse.content.size());
 
         // Close the transaction.
         manager.closeTransaction(transaction);

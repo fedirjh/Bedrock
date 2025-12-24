@@ -1,12 +1,9 @@
-#include <libstuff/libstuff.h>
 #include "BedrockCore.h"
 #include "BedrockPlugin.h"
 #include "BedrockServer.h"
+#include <libstuff/libstuff.h>
 
-BedrockCore::BedrockCore(SQLite& db, const BedrockServer& server) :
-SQLiteCore(db),
-_server(server)
-{ }
+BedrockCore::BedrockCore(SQLite& db, const BedrockServer& server) : SQLiteCore(db), _server(server) {}
 
 // RAII-style mechanism for automatically setting and unsetting query rewriting
 class AutoScopeRewrite {
@@ -23,6 +20,7 @@ class AutoScopeRewrite {
             _db.enableRewrite(false);
         }
     }
+
   private:
     bool _enable;
     SQLite& _db;
@@ -116,7 +114,6 @@ void BedrockCore::prePeekCommand(unique_ptr<BedrockCommand>& command, bool isBlo
         command->response.methodLine = "500 Unhandled Exception";
         command->complete = true;
         command->_inDBReadOperation = false;
-
     }
     _db.clearTimeout();
     _db.clearAbortRef();
@@ -144,8 +141,9 @@ BedrockCore::RESULT BedrockCore::peekCommand(unique_ptr<BedrockCommand>& command
             if (!_db.beginTransaction(exclusive ? SQLite::TRANSACTION_TYPE::EXCLUSIVE : SQLite::TRANSACTION_TYPE::SHARED)) {
                 STHROW("501 Failed to begin " + (exclusive ? "exclusive"s : "shared"s) + " transaction");
             }
+
             if (exclusive && command->writeConsistency != SQLiteNode::QUORUM) {
-                decreaseCommandTimeout(command, BedrockCommand::DEFAULT_BLOCKING_TRANSACTION_COMMIT_LOCK_TIMEOUT);
+                decreaseCommandTimeout(command, BedrockCommand::DEFAULT_PROCESS_TIMEOUT);
             }
 
             // We start the timer here to avoid including the time spent acquiring the lock _sharedData.commitLock
@@ -172,7 +170,7 @@ BedrockCore::RESULT BedrockCore::peekCommand(unique_ptr<BedrockCommand>& command
         } catch (const SQLite::timeout_error& e) {
             // Some plugins want to alert timeout errors themselves, and make them silent on bedrock.
             if (!command->shouldSuppressTimeoutWarnings()) {
-                SALERT("Command " << command->request.methodLine << " timed out after " << e.time()/1000 << "ms.");
+                SALERT("Command " << command->request.methodLine << " timed out after " << e.time() / 1000 << "ms.");
             }
             command->_inDBReadOperation = false;
             STHROW("555 Timeout peeking command");
@@ -212,7 +210,7 @@ BedrockCore::RESULT BedrockCore::peekCommand(unique_ptr<BedrockCommand>& command
     command->complete = returnValue == RESULT::COMPLETE;
 
     // Back out of the current transaction, it doesn't need to do anything.
-    _db.rollback();
+    _db.rollback(command->getMethodName());
     _db.clearTimeout();
     _db.clearAbortRef();
 
@@ -243,8 +241,9 @@ BedrockCore::RESULT BedrockCore::processCommand(unique_ptr<BedrockCommand>& comm
             if (!_db.beginTransaction(exclusive ? SQLite::TRANSACTION_TYPE::EXCLUSIVE : SQLite::TRANSACTION_TYPE::SHARED)) {
                 STHROW("501 Failed to begin " + (exclusive ? "exclusive"s : "shared"s) + " transaction");
             }
+
             if (exclusive && command->writeConsistency != SQLiteNode::QUORUM) {
-                decreaseCommandTimeout(command, BedrockCommand::DEFAULT_BLOCKING_TRANSACTION_COMMIT_LOCK_TIMEOUT);
+                decreaseCommandTimeout(command, BedrockCommand::DEFAULT_PROCESS_TIMEOUT);
             }
         }
 
@@ -267,7 +266,7 @@ BedrockCore::RESULT BedrockCore::processCommand(unique_ptr<BedrockCommand>& comm
                 SDEBUG("Plugin '" << command->getName() << "' processed command '" << request.methodLine << "'");
             } catch (const SQLite::timeout_error& e) {
                 if (!command->shouldSuppressTimeoutWarnings()) {
-                    SALERT("Command " << command->request.methodLine << " timed out after " << e.time()/1000 << "ms.");
+                    SALERT("Command " << command->request.methodLine << " timed out after " << e.time() / 1000 << "ms.");
                 }
                 STHROW("555 Timeout processing command");
             }
@@ -275,7 +274,7 @@ BedrockCore::RESULT BedrockCore::processCommand(unique_ptr<BedrockCommand>& comm
 
         // If we have no uncommitted query, just rollback the empty transaction. Otherwise, we need to commit.
         if (_db.getUncommittedQuery().empty() && !command->shouldCommitEmptyTransactions()) {
-            _db.rollback();
+            _db.rollback(command->getMethodName());
         } else {
             needsCommit = true;
         }
@@ -301,19 +300,19 @@ BedrockCore::RESULT BedrockCore::processCommand(unique_ptr<BedrockCommand>& comm
         }
     } catch (const SException& e) {
         _handleCommandException(command, e, &_db, &_server);
-        _db.rollback();
+        _db.rollback(command->getMethodName());
         needsCommit = false;
         command->_inDBWriteOperation = false;
     } catch (const SQLite::constraint_error& e) {
         SWARN("Unique Constraints Violation, command: " << request.methodLine);
         command->response.methodLine = "400 Unique Constraints Violation";
-        _db.rollback();
+        _db.rollback(command->getMethodName());
         needsCommit = false;
         command->_inDBWriteOperation = false;
-    } catch(...) {
+    } catch (...) {
         SALERT("Unhandled exception typename: " << SGetCurrentExceptionName() << ", command: " << request.methodLine);
         command->response.methodLine = "500 Unhandled Exception";
-        _db.rollback();
+        _db.rollback(command->getMethodName());
         needsCommit = false;
         command->_inDBWriteOperation = false;
     }
@@ -357,7 +356,7 @@ void BedrockCore::postProcessCommand(unique_ptr<BedrockCommand>& command, bool i
             SDEBUG("Plugin '" << command->getName() << "' postProcess command '" << request.methodLine << "'");
 
             // Success. If a command has set "content", encode it in the response.
-            SINFO("Responding '" << response.methodLine << "' to read-only '" << request.methodLine << "'.");
+            SDEBUG("Responding '" << response.methodLine << "' to read-only '" << request.methodLine << "'.");
             if (!content.empty()) {
                 // Make sure we're not overwriting anything different.
                 string newContent = SComposeJSONObject(content);
@@ -371,7 +370,7 @@ void BedrockCore::postProcessCommand(unique_ptr<BedrockCommand>& command, bool i
         } catch (const SQLite::timeout_error& e) {
             // Some plugins want to alert timeout errors themselves, and make them silent on bedrock.
             if (!command->shouldSuppressTimeoutWarnings()) {
-                SALERT("Command " << command->request.methodLine << " timed out after " << e.time()/1000 << "ms.");
+                SALERT("Command " << command->request.methodLine << " timed out after " << e.time() / 1000 << "ms.");
             }
             command->_inDBReadOperation = false;
             STHROW("555 Timeout postProcessing command");
@@ -433,8 +432,7 @@ void BedrockCore::_handleCommandException(unique_ptr<BedrockCommand>& command, c
     }
 }
 
-void BedrockCore::decreaseCommandTimeout(unique_ptr<BedrockCommand>& command, uint64_t timeoutMS)
-{
+void BedrockCore::decreaseCommandTimeout(unique_ptr<BedrockCommand>& command, uint64_t timeoutMS) {
     const uint64_t remainingTimeUS = _getRemainingTime(command, false);
     if ((timeoutMS * 1000ull) < remainingTimeUS) {
         command->setTimeout(timeoutMS);

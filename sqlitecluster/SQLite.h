@@ -80,7 +80,7 @@ class SQLite {
     string read(const string& query) const;
 
     // Performs a read-only query (eg, SELECT) that uses a query result formatter to format the response.
-    bool read(const string& query, sqlite3_qrf_spec* spec) const;
+    int read(const string& query, sqlite3_qrf_spec* spec) const;
 
     // Types of transactions that we can begin.
     enum class TRANSACTION_TYPE {
@@ -182,17 +182,16 @@ class SQLite {
     // Commits the current transaction to disk. Returns an sqlite3 result code.
     // preCheckpointCallback is an optional callback that will be called before the checkpoint code runs, after the commit has completed. Note that if the commit fails, this is not called.
     // The main purpose of this is to allow replications in SQLiteNode to notify other waiting threads that the commit has finished even before the checkpoint is done.
-    int commit(const string& description = "UNSPECIFIED", function<void()>* preCheckpointCallback = nullptr);
+    int commit(const string& description = "UNSPECIFIED", const string& commandName = "", function<void()>* preCheckpointCallback = nullptr);
 
     // Cancels the current transaction and rolls it back.
-    void rollback();
+    void rollback(const string& commandName = "");
 
     // Returns the total number of changes on this database
     int getChangeCount() { return sqlite3_total_changes(_db); }
 
     // Returns the timing of the last command
-    uint64_t getLastTransactionTiming(uint64_t& begin, uint64_t& read, uint64_t& write, uint64_t& prepare,
-                                      uint64_t& commit, uint64_t& rollback);
+    void logLastTransactionTiming(const string& message, const string& commandName);
 
     TRANSACTION_TYPE getLastTransactionType();
 
@@ -426,6 +425,10 @@ class SQLite {
     uint64_t _prepareElapsed = 0;
     uint64_t _commitElapsed = 0;
     uint64_t _rollbackElapsed = 0;
+    uint64_t _commitLockElapsed = 0;
+    uint64_t _totalTransactionElapsed = 0;
+
+    SPerformanceTimer _transactionTimer;
 
     // We keep track of whether we've locked the global mutex so that we know whether or not we need to unlock it when
     // we call `rollback`. Note that this indicates whether this object has locked the mutex, not whether the mutex is
@@ -562,4 +565,7 @@ class SQLite {
 
     // One of 0|1|2|3 (a.k.a. PASSIVE|FULL|RESTART|TRUNCATE), which is the value to be passed to sqlite3_wal_checkpoint_v2.
     int _checkpointMode;
+
+    // Difference in page count from the start to the end of the transaction. Only counted on HC-Tree databases.
+    int64_t _pageCountDifference = 0;
 };

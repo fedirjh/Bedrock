@@ -94,6 +94,9 @@ thread_local bool isSyncThread;
 // We store the process name passed in `SInitialize` to use in logging.
 thread_local string SProcessName;
 
+// We truncate the logged query size because a huge query once caused a fire: https://github.com/Expensify/Bedrock/pull/1476
+const size_t MAX_LOG_QUERY_SIZE = 200000;
+
 // This is a set of reusable sockets, each with an associated mutex, to allow for parallel logging directly to the
 // syslog socket, rather than going through the syslog() system call, which goes through journald.
 const size_t S_LOG_SOCKET_MAX = 500;
@@ -243,7 +246,7 @@ void SSyslogSocketDirect(int priority, const char *format, ...) {
         // and treats them as part of the message.
         string messageHeader = "<" + to_string(8 + priority) + ">" + SProcessName + ": ";
         thread_local char messageBuffer[MAX_MESSAGE_SIZE];
-        strcpy(messageBuffer, messageHeader.c_str());
+        memcpy(messageBuffer, messageHeader.c_str(), min(messageHeader.size(), (size_t) MAX_MESSAGE_SIZE));
         va_list argptr;
         va_start(argptr, format);
         int bytesWritten = vsnprintf(messageBuffer + messageHeader.size(), MAX_MESSAGE_SIZE - messageHeader.size(), format, argptr);
@@ -585,49 +588,63 @@ string SReplace(const string& value, const string& find, const string& replace) 
     if (find.empty())
         return value;
 
-    // Keep going until we find no more
-    string out;
-    out.reserve(value.size());
-    size_t skip = 0;
-    while (true) {
-        // Look for the next match
-        size_t pos = value.find(find, skip);
-        if (pos == string::npos) {
-            // Add the rest and done
-            out += value.substr(skip);
-            return out;
-        }
-
-        // Replace
-        out += value.substr(skip, pos - skip);
-        out += replace;
-        skip = pos + find.size();
+    // Look for first match
+    size_t pos = value.find(find);
+    if (pos == string::npos) {
+        // No matches, return original
+        return value;
     }
+
+    // Reserve a reasonable size (use value.size() as minimum, will grow if needed)
+    string out;
+    out.reserve(value.size() + (replace.size() > find.size() ? replace.size() - find.size() : 0));
+
+    // Build output string in single pass
+    size_t lastPos = 0;
+    do {
+        // Append text before match using pointers (avoids substr)
+        out.append(value.data() + lastPos, pos - lastPos);
+        out.append(replace);
+        lastPos = pos + find.size();
+        pos = value.find(find, lastPos);
+    } while (pos != string::npos);
+
+    // Append remaining text
+    out.append(value.data() + lastPos, value.size() - lastPos);
+    return out;
 }
 
 // --------------------------------------------------------------------------
 string SReplaceAllBut(const string& value, const string& safeChars, char replaceChar) {
-    // Loop across the string and replace any invalid character
-    string out;
-    out.reserve(value.size());
-    for (const char* c(value.data()); *c; ++c)
-        if (safeChars.find(*c) != string::npos)
-            out += *c;
-        else
-            out += replaceChar;
+    // Build a lookup table for O(1) character checking
+    bool isSafe[256] = {false};
+    for (unsigned char c : safeChars) {
+        isSafe[c] = true;
+    }
+
+    // Pre-size output string and write directly (output size = input size)
+    string out(value.size(), '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(value[i]);
+        out[i] = isSafe[c] ? value[i] : replaceChar;
+    }
     return out;
 }
 
 // --------------------------------------------------------------------------
 string SReplaceAll(const string& value, const string& unsafeChars, char replaceChar) {
-    // Loop across the string and replace any invalid character
-    string out;
-    out.reserve(value.size());
-    for (const char* c(value.data()); *c; ++c)
-        if (unsafeChars.find(*c) == string::npos)
-            out += *c;
-        else
-            out += replaceChar;
+    // Build a lookup table for O(1) character checking
+    bool isUnsafe[256] = {false};
+    for (unsigned char c : unsafeChars) {
+        isUnsafe[c] = true;
+    }
+
+    // Pre-size output string and write directly (output size = input size)
+    string out(value.size(), '\0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        unsigned char c = static_cast<unsigned char>(value[i]);
+        out[i] = isUnsafe[c] ? replaceChar : value[i];
+    }
     return out;
 }
 
@@ -1829,6 +1846,8 @@ int S_socket(const string& host, bool isTCP, bool isPort, bool isBlocking) {
         if (!s || s == -1)
             STHROW("couldn't open");
 
+        fcntl(s, F_SETFD, fcntl(s, F_GETFD) | FD_CLOEXEC);
+
         // Enable non-blocking, if requested
         if (!isBlocking) {
             // Set non-blocking
@@ -2715,7 +2734,7 @@ int SQuery(sqlite3* db, const string& sql, SQResult& result, int64_t warnThresho
     if (error == SQLITE_CORRUPT) {
         if (extErr == SQLITE_CORRUPT_INDEX) {
             // Avoid logging queries so long that we need dozens of lines to log them.
-            string sqlToLog = sql.substr(0, 40000);
+            string sqlToLog = sql.substr(0, MAX_LOG_QUERY_SIZE);
             SRedactSensitiveValues(sqlToLog);
             SALERT("ENSURE_BUGBOT Database index corruption was detected.", {{"query", sqlToLog}});
         } else {
@@ -2726,7 +2745,7 @@ int SQuery(sqlite3* db, const string& sql, SQResult& result, int64_t warnThresho
     uint64_t elapsed = STimeNow() - startTime;
     if (!skipInfoWarn && ((int64_t)elapsed > warnThreshold || (int64_t)elapsed > 10000)) {
         // Avoid logging queries so long that we need dozens of lines to log them.
-        string sqlToLog = sql.substr(0, 40000);
+        string sqlToLog = sql.substr(0, MAX_LOG_QUERY_SIZE);
         SRedactSensitiveValues(sqlToLog);
 
         if ((int64_t)elapsed > warnThreshold) {
@@ -2750,7 +2769,7 @@ int SQuery(sqlite3* db, const string& sql, SQResult& result, int64_t warnThresho
 
     // Log this if enabled
     if (_g_sQueryLogFP) {
-        string sqlToLog = sql.substr(0, 20000);
+        string sqlToLog = sql.substr(0, MAX_LOG_QUERY_SIZE);
 
         // Log this query as an SQL statement ready for insertion
         const string& dbFilename = sqlite3_db_filename(db, "main");
@@ -2762,7 +2781,7 @@ int SQuery(sqlite3* db, const string& sql, SQResult& result, int64_t warnThresho
     // Only OK and commit conflicts are allowed without warning because they're the only "successful" results that we expect here.
     // OK means it succeeds, conflicts will get retried further up the call stack.
     if (error != SQLITE_OK && extErr != SQLITE_BUSY_SNAPSHOT && !skipInfoWarn) {
-        string sqlToLog = sql.substr(0, 20000);
+        string sqlToLog = sql.substr(0, MAX_LOG_QUERY_SIZE);
         SRedactSensitiveValues(sqlToLog);
 
         // We don't warn for constraints errors because sometimes they're allowed, and BedrockCore.cpp will warn for the ones that aren't.
@@ -2770,6 +2789,7 @@ int SQuery(sqlite3* db, const string& sql, SQResult& result, int64_t warnThresho
         // We also don't warn for `interrupt` because it generally means a timeout which is handled separately.
         if (error == SQLITE_CONSTRAINT || error == SQLITE_INTERRUPT) {
             SINFO("query failed with error #" << error << " (" << sqlite3_errmsg(db) << "): " << sqlToLog);
+            SLogStackTrace(LOG_INFO);
         } else {
             SWARN("query failed with error #" << error << " (" << sqlite3_errmsg(db) << "): " << sqlToLog);
         }
@@ -2946,15 +2966,23 @@ string SREReplace(const string& regExp, const string& input, const string& repla
             output = (char*)malloc(outSize);
         } else if (result < 0) {
             SHMMM("Regex replacement failed with result " << result << ", returning nothing.");
+            if (output) {
+                free(output);
+            }
             output = (char*)malloc(1);
             *output = 0;
             break;
         }
     }
-    string outputString(output);
+
+    string outputString;
+    if (output) {
+        outputString = output;
+        free(output);
+    }
+
     pcre2_code_free(re);
     pcre2_match_context_free(matchContext);
-    free(output);
 
     return outputString;
 }

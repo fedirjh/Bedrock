@@ -6,6 +6,8 @@
 #include <libstuff/libstuff.h>
 #include <libstuff/SDeburr.h>
 #include <libstuff/SQResult.h>
+#include <string>
+#include <format>
 
 #define DBINFO(_MSG_) SINFO("{" << _filename << "} " << _MSG_)
 
@@ -250,6 +252,7 @@ SQLite::SQLite(const string& filename, int cacheSize, int maxJournalSize,
     _db(initializeDB(_filename, mmapSizeGB, _hctree)),
     _journalNames(initializeJournal(_db, minJournalTables)),
     _sharedData(initializeSharedData(_db, _filename, _journalNames, _hctree)),
+    _transactionTimer("transaction timer"),
     _cacheSize(cacheSize),
     _mmapSizeGB(mmapSizeGB),
     _checkpointMode(getCheckpointModeFromString(checkpointMode))
@@ -264,6 +267,7 @@ SQLite::SQLite(const SQLite& from) :
     _db(initializeDB(_filename, from._mmapSizeGB, false)), // Create a *new* DB handle from the same filename, don't copy the existing handle.
     _journalNames(from._journalNames),
     _sharedData(from._sharedData),
+    _transactionTimer("transaction timer"),
     _cacheSize(from._cacheSize),
     _mmapSizeGB(from._mmapSizeGB),
     _checkpointMode(from._checkpointMode)
@@ -309,6 +313,11 @@ int SQLite::_walHookCallback(void* sqliteObject, sqlite3* db, const char* name, 
 }
 
 void SQLite::_sqliteLogCallback(void* pArg, int iErrCode, const char* zMsg) {
+    // Skip logging this as it generates a lot of noise and we don't use it.
+    if (strstr(zMsg, "automatic index on")) {
+        return;
+    }
+
     _mostRecentSQLiteErrorLog = "{SQLITE} Code: "s + to_string(iErrCode) + ", Message: "s + zMsg;
     SRedactSensitiveValues(_mostRecentSQLiteErrorLog);
     SINFO(_mostRecentSQLiteErrorLog);
@@ -402,6 +411,7 @@ SQLite::TRANSACTION_TYPE SQLite::getLastTransactionType() {
 
 bool SQLite::beginTransaction(SQLite::TRANSACTION_TYPE type) {
     _lastTransactionType = type;
+    _transactionTimer.start("BEGIN_TRANSACTION");
     if (type == TRANSACTION_TYPE::EXCLUSIVE) {
         if (isSyncThread) {
             // Blocking the sync thread has catastrophic results (forking) and so we either get this quickly, or we fail the transaction.
@@ -440,9 +450,18 @@ bool SQLite::beginTransaction(SQLite::TRANSACTION_TYPE type) {
     // We actively track transaction counts incrementing and decrementing to log the number of active open transactions at any given moment.
     _sharedData.openTransactionCount++;
 
-    SINFO("Beginning transaction - open transaction count: " << (_sharedData.openTransactionCount));
+    if (_sharedData.openTransactionCount > 10) {
+        SINFO("Beginning transaction - open transaction count: " << (_sharedData.openTransactionCount));
+    }
     uint64_t before = STimeNow();
     _insideTransaction = !SQuery(_db, "BEGIN CONCURRENT");
+    if(_hctree) {
+        SQResult pageCountResult;
+        SQuery(_db, "PRAGMA page_count;", pageCountResult);
+        if (!pageCountResult.empty()) {
+            _pageCountDifference = SToUInt64(pageCountResult[0][0]) - _pageCountDifference;
+        }
+    }
 
     // Because some other thread could commit once we've run `BEGIN CONCURRENT`, this value can be slightly behind
     // where we're actually able to start such that we know we shouldn't get a conflict if this commits successfully on
@@ -460,9 +479,11 @@ bool SQLite::beginTransaction(SQLite::TRANSACTION_TYPE type) {
     _writeElapsed = 0;
     _prepareElapsed = 0;
     _commitElapsed = 0;
+    _commitLockElapsed = 0;
     _rollbackElapsed = 0;
     _lastConflictPage = 0;
     _lastConflictLocation = "";
+    _totalTransactionElapsed = 0;
     return _insideTransaction;
 }
 
@@ -546,10 +567,10 @@ string SQLite::read(const string& query) const {
     return result[0][0];
 }
 
-bool SQLite::read(const string& query, sqlite3_qrf_spec* spec) const {
+int SQLite::read(const string& query, sqlite3_qrf_spec* spec) const {
     // Execute the read-only query. Skips caching.
     uint64_t before = STimeNow();
-    bool queryResult = !SQuery(_db, query, spec);
+    int queryResult = SQuery(_db, query, spec);
     _checkInterruptErrors("SQLite::read"s);
     _readElapsed += STimeNow() - before;
     return queryResult;
@@ -802,7 +823,7 @@ bool SQLite::prepare(uint64_t* transactionID, string* transactionhash) {
     return true;
 }
 
-int SQLite::commit(const string& description, function<void()>* preCheckpointCallback) {
+int SQLite::commit(const string& description, const string& commandName, function<void()>* preCheckpointCallback) {
     // If commits have been disabled, return an error without attempting the commit.
     if (!_sharedData._commitEnabled) {
         return COMMIT_DISABLED;
@@ -823,7 +844,21 @@ int SQLite::commit(const string& description, function<void()>* preCheckpointCal
     _conflictLocation = "";
     uint64_t before = STimeNow();
     uint64_t beforeCommit = STimeNow();
+    if(_hctree) {
+        SQResult pageCountResult;
+        SQuery(_db, "PRAGMA page_count;", pageCountResult);
+        if (!pageCountResult.empty()) {
+            _pageCountDifference = SToInt64(pageCountResult[0][0]);
+        }
+    }
     result = SQuery(_db, "COMMIT");
+    if(_hctree) {
+        SQResult pageCountResult;
+        SQuery(_db, "PRAGMA page_count;", pageCountResult);
+        if (!pageCountResult.empty()) {
+            _pageCountDifference = SToUInt64(pageCountResult[0][0]) - _pageCountDifference;
+        }
+    }
 
     // In HCTree mode, we log extra info for slow commits.
     /* This is disabled because the diagnostic logging is unreasonably expensive (30+ seconds for the query).
@@ -866,11 +901,12 @@ int SQLite::commit(const string& description, function<void()>* preCheckpointCal
         }
 
         _commitElapsed += STimeNow() - before;
+        _commitLockElapsed += _sharedData._commitLockTimer.stop();
+        _totalTransactionElapsed = _transactionTimer.stop();
         _sharedData.incrementCommit(_uncommittedHash);
         _insideTransaction = false;
         _uncommittedHash.clear();
         _uncommittedQuery.clear();
-        _sharedData._commitLockTimer.stop();
         _sharedData.commitLock.unlock();
         _mutexLocked = false;
         _queryCache.clear();
@@ -895,9 +931,19 @@ int SQLite::commit(const string& description, function<void()>* preCheckpointCal
             }
             _sharedData.checkpointInProgress.clear();
         }
-        SINFO(description << " COMMIT " << SToStr(_sharedData.commitCount) << " complete in " << time << ". Wrote " << (endPages - startPages)
-              << " pages. WAL file size is " << sz << " bytes. " << _readQueryCount << " read queries attempted, " << _writeQueryCount << " write queries attempted, " << _cacheHits
-              << " served from cache. Used journal " << _journalName);
+        logLastTransactionTiming(
+            format("{} COMMIT {} complete in {}. Wrote {} pages. WAL file size is {} bytes. {} read queries attempted, {} write queries attempted, {} served from cache. Used journal {}.{}",
+                description,
+                SToStr(_sharedData.commitCount),
+                time,
+                (endPages - startPages),
+                sz,
+                _readQueryCount,
+                _writeQueryCount,
+                _cacheHits,
+                _journalName,
+                (_hctree ? format(" HC-Tree pages added: {}", _pageCountDifference) : "")),
+            commandName);
         _readQueryCount = 0;
         _writeQueryCount = 0;
         _cacheHits = 0;
@@ -933,9 +979,12 @@ map<uint64_t, tuple<string, string, uint64_t>> SQLite::popCommittedTransactions(
     return _sharedData.popCommittedTransactions();
 }
 
-void SQLite::rollback() {
+void SQLite::rollback(const string& commandName) {
     // Make sure we're actually inside a transaction
     if (_insideTransaction) {
+        // Store the total transaction time only if we were inside one.
+        _totalTransactionElapsed = _transactionTimer.stop();
+
         // Cancel this transaction
         if (_autoRolledBack) {
             SINFO("Transaction was automatically rolled back, not sending 'ROLLBACK'.");
@@ -960,30 +1009,42 @@ void SQLite::rollback() {
         // ever having called `prepare`, which would have locked our mutex.
         if (_mutexLocked) {
             _mutexLocked = false;
-            _sharedData._commitLockTimer.stop();
+            _commitLockElapsed += _sharedData._commitLockTimer.stop();
             _sharedData.commitLock.unlock();
         }
     } else {
+        // Stop the timer without storing the time spent since transaction as already rolled back.
+        _transactionTimer.stop();
+        _totalTransactionElapsed = 0;
         SINFO("Rolling back but not inside transaction, ignoring.");
     }
     _queryCache.clear();
-    SINFO("Transaction rollback with " << _readQueryCount << " read queries attempted, " << _writeQueryCount << " write queries attempted, " << _cacheHits << " served from cache.");
+    logLastTransactionTiming(
+        format("Transaction rollback with {} read queries attempted, {} write queries attempted, {} served from cache.", _readQueryCount, _writeQueryCount, _cacheHits),
+        commandName
+    );
     _readQueryCount = 0;
     _writeQueryCount = 0;
     _cacheHits = 0;
     _dbCountAtStart = 0;
 }
 
-uint64_t SQLite::getLastTransactionTiming(uint64_t& begin, uint64_t& read, uint64_t& write, uint64_t& prepare,
-                                          uint64_t& commit, uint64_t& rollback) {
-    // Just populate and return
-    begin = _beginElapsed;
-    read = _readElapsed;
-    write = _writeElapsed;
-    prepare = _prepareElapsed;
-    commit = _commitElapsed;
-    rollback = _rollbackElapsed;
-    return begin + read + write + prepare + commit + rollback;
+void SQLite::logLastTransactionTiming(const string& message, const string& commandName) {
+    // We don't want to add `commitLockElapsed` and `totalTransactionElapsed` to the total elapsed time since they overlap with parts of the transaction
+    // and that could double-count certain times (i.e. `commitElapsed` occurs simultaneously with `commitLockElapsed`)
+    uint64_t totalElapsed = _beginElapsed + _readElapsed + _writeElapsed + _prepareElapsed + _commitElapsed + _rollbackElapsed;
+    SINFO(message, {
+        {"command", commandName},
+        {"totalElapsed", to_string(totalElapsed/1000)},
+        {"readElapsed", to_string(_readElapsed/1000)},
+        {"writeElapsed", to_string(_writeElapsed/1000)},
+        {"prepareElapsed", to_string(_prepareElapsed/1000)},
+        {"commitElapsed", to_string(_commitElapsed/1000)},
+        {"rollbackElapsed", to_string(_rollbackElapsed/1000)},
+        {"totalTransactionElapsed", to_string(_totalTransactionElapsed/1000)},
+        {"beginElapsed", to_string(_beginElapsed/1000)},
+        {"commitLockElapsed", to_string(_commitLockElapsed/1000)},
+    });
 }
 
 bool SQLite::getCommit(uint64_t id, string& query, string& hash) {

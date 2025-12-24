@@ -1,5 +1,6 @@
 // Manages connections to a single instance of the bedrock server.
 #include "BedrockServer.h"
+#include "BedrockCommand.h"
 #include "sqlitecluster/SQLiteNode.h"
 
 #include <arpa/inet.h>
@@ -311,7 +312,7 @@ void BedrockServer::sync()
                 _upgradeInProgress = false;
                 if (committingCommand) {
                     db.rollback();
-                    committingCommand = false;
+                    committingCommand = false; //NOLINT
                 }
             }
 
@@ -547,7 +548,7 @@ void BedrockServer::sync()
                             command->response.methodLine = "500 Refused";
                             command->complete = true;
                             _reply(command);
-                            core.rollback();
+                            core.rollback(command->getMethodName());
                             break;
                         }
                     }
@@ -935,7 +936,7 @@ void BedrockServer::runCommand(unique_ptr<BedrockCommand>&& _command, bool isBlo
                         if (command->repeek || !command->areHttpsRequestsComplete()) {
                             // Roll back the existing transaction, but only if we are inside an transaction
                             if (calledPeek) {
-                                core.rollback();
+                                core.rollback(command->getMethodName());
                             }
 
                             // Jump back to the top of our main `while (true)` loop and run the network activity loop again.
@@ -955,7 +956,7 @@ void BedrockServer::runCommand(unique_ptr<BedrockCommand>&& _command, bool isBlo
                     // Peek wasn't enough to handle this command. See if we think it should be writable in parallel.
                     if (!canWriteParallel) {
                         // Roll back the transaction, it'll get re-run in the sync thread.
-                        core.rollback();
+                        core.rollback(command->getMethodName());
                         dbScope.release();
                         auto _clusterMessengerCopy = _clusterMessenger;
                         if (getState() == SQLiteNodeState::LEADING) {
@@ -999,7 +1000,7 @@ void BedrockServer::runCommand(unique_ptr<BedrockCommand>&& _command, bool isBlo
                             BedrockCore::AutoTimer timer(command, isBlocking ? BedrockCommand::BLOCKING_COMMIT_WORKER : BedrockCommand::COMMIT_WORKER);
                             void (*onPrepareHandler)(SQLite& db, int64_t tableID) = nullptr;
                             bool enableOnPrepareNotifications = command->shouldEnableOnPrepareNotification(db, &onPrepareHandler);
-                            commitSuccess = core.commit(*_syncNode, transactionID, transactionHash, enableOnPrepareNotifications, onPrepareHandler);
+                            commitSuccess = core.commit(*_syncNode, transactionID, transactionHash, command->getMethodName(), enableOnPrepareNotifications, onPrepareHandler);
 
                             if (getState() != SQLiteNodeState::LEADING) {
                                 SINFO("Stopped leading while trying to commit, will retry.");
@@ -1040,7 +1041,7 @@ void BedrockServer::runCommand(unique_ptr<BedrockCommand>&& _command, bool isBlo
                         // of this block.
                     } else if (result == BedrockCore::RESULT::SERVER_NOT_LEADING) {
                         // We won't write regardless.
-                        core.rollback();
+                        core.rollback(command->getMethodName());
 
                         // If there are no HTTPS requests, we can just re-queue this command, otherwise, we will
                         // potentially run the same HTTPS requests twice.
@@ -1484,7 +1485,9 @@ void BedrockServer::postPoll(fd_map& fdm, uint64_t& nextActivity) {
 
             // This interrupts the sync thread's poll() loop so it doesn't wait for up to an extra second to finish.
             // When it wakes up, it will begin its own shutdown.
-            _syncNode->notifyCommit();
+            if (_syncNode) {
+                _syncNode->notifyCommit();
+            }
         }
     }
 }
@@ -2044,6 +2047,7 @@ SData BedrockServer::_generateCrashMessage(const unique_ptr<BedrockCommand>& com
     for (auto& pair : command->crashIdentifyingValues) {
         subMessage.emplace(pair);
     }
+    message["timeout"] = "5000";
     message.content = subMessage.serialize();
     return message;
 }
@@ -2061,6 +2065,7 @@ void BedrockServer::broadcastCommand(const SData& command) {
 
 void BedrockServer::onNodeLogin(SQLitePeer* peer)
 {
+    list<unique_ptr<BedrockCommand>> crashCommandsToSend;
     shared_lock<decltype(_crashCommandMutex)> lock(_crashCommandMutex);
     for (const auto& p : _crashCommands) {
         for (const auto& table : p.second) {
@@ -2071,11 +2076,17 @@ void BedrockServer::onNodeLogin(SQLitePeer* peer)
             for (const auto& fields : table) {
                 crashCommand->crashIdentifyingValues.insert(fields.first);
             }
-            auto _clusterMessengerCopy = _clusterMessenger;
-            if (_clusterMessengerCopy) {
-                BedrockCommand peerCommand(_generateCrashMessage(crashCommand), nullptr);
-                _clusterMessengerCopy->runOnPeer(peerCommand, peer->name);
-            }
+            crashCommandsToSend.push_back(make_unique<BedrockCommand>(_generateCrashMessage(crashCommand), nullptr));
+        }
+    }
+
+    for (auto& peerCommand : crashCommandsToSend) {
+        auto _clusterMessengerCopy = _clusterMessenger;
+        auto peerName = peer->name;
+        if (_clusterMessengerCopy) {
+            thread([command = move(peerCommand), _clusterMessengerCopy, peerName](){
+                        _clusterMessengerCopy->runOnPeer(*command, peerName);
+            }).detach();
         }
     }
 }

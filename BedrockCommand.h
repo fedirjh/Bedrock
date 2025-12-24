@@ -46,8 +46,7 @@ class BedrockCommand : public SQLiteCommand {
     // Times in *milliseconds*.
     static const uint64_t DEFAULT_TIMEOUT = 110'000; // 110 seconds, so clients can have a 2 minutes timeout.
     static const uint64_t DEFAULT_TIMEOUT_FORGET = 60'000 * 60; // 1 hour for `connection: forget` commands.
-    static const uint64_t DEFAULT_PROCESS_TIMEOUT = 30'000; // 30 seconds.
-    static const uint64_t DEFAULT_BLOCKING_TRANSACTION_COMMIT_LOCK_TIMEOUT = 10'000; // 10 seconds.
+    static const uint64_t DEFAULT_PROCESS_TIMEOUT = 10'000; // 10 seconds.
 
     // Constructor to initialize via a request object (by move).
     BedrockCommand(SQLiteCommand&& baseCommand, BedrockPlugin* plugin, bool escalateImmediately_ = false);
@@ -133,6 +132,9 @@ class BedrockCommand : public SQLiteCommand {
 
     // Returns true if all of the httpsRequests for this command are complete (or if it has none).
     bool areHttpsRequestsComplete() const;
+
+    // Returns the method name of this command, appending the return value list if it exists.
+    virtual string getMethodName() const;
 
     // If the `peek` portion of this command needs to make an HTTPS request, this is where we store it.
     template <typename T>
