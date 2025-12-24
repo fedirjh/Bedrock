@@ -2,10 +2,13 @@
 #include <libstuff/SHTTPSManager.h>
 #include <test/lib/tpunit++.hpp>
 
-struct HTTPSLabelTest : tpunit::TestFixture {
+struct HTTPSLabelTest : tpunit::TestFixture
+{
     HTTPSLabelTest()
         : tpunit::TestFixture("HTTPSLabel",
-                              TEST(HTTPSLabelTest::serializeDeserializePreservesLabels)) {}
+                              TEST(HTTPSLabelTest::serializeDeserializePreservesLabels))
+    {
+    }
 
     void serializeDeserializePreservesLabels()
     {

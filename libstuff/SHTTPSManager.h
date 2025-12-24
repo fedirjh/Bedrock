@@ -6,8 +6,9 @@
 class BedrockPlugin;
 
 class SStandaloneHTTPSManager : public STCPManager {
-  public:
-    struct Transaction {
+public:
+    struct Transaction
+    {
         // Constructor/Destructor
         Transaction(SStandaloneHTTPSManager& manager_, const string& requestID = "", const string& label_ = "");
         ~Transaction();
@@ -45,7 +46,7 @@ class SStandaloneHTTPSManager : public STCPManager {
 
     static int getHTTPResponseCode(const string& methodLine);
 
-  protected: // Child API
+protected:   // Child API
 
     // Used to create the signing certificate.
     const string _pem;
@@ -61,11 +62,11 @@ class SStandaloneHTTPSManager : public STCPManager {
 };
 
 class SHTTPSManager : public SStandaloneHTTPSManager {
-    public:
+public:
     SHTTPSManager(BedrockPlugin& plugin_);
     SHTTPSManager(BedrockPlugin& plugin_, const string& pem, const string& srvCrt, const string& caCrt);
 
-    protected:
+protected:
     // Reference to the plugin that owns this object.
     BedrockPlugin& plugin;
 };
